@@ -29,10 +29,30 @@ export default function ConversationList({ isOpen, onClose }) {
                                 key={conv.id}
                                 className={`conv-item ${currentConvId === conv.id ? 'active' : ''}`}
                                 onClick={() => handleSelectConversation(conv.id)}
+                                style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
                             >
                                 <span className="conv-item__title">
                                     {conv.title || 'UNTITLED SESSION'}
                                 </span>
+                                <button
+                                    className="btn-delete-conv"
+                                    onClick={(e) => {
+                                        e.stopPropagation()
+                                        if (confirm('Delete this session?')) {
+                                            useGraphStore.getState().deleteConversation(conv.id)
+                                        }
+                                    }}
+                                    style={{
+                                        background: 'none',
+                                        border: 'none',
+                                        color: '#666',
+                                        cursor: 'pointer',
+                                        fontSize: '12px',
+                                        padding: '4px'
+                                    }}
+                                >
+                                    ×
+                                </button>
                             </div>
                         ))}
                     </div>

@@ -18,6 +18,7 @@ export default function SearchBar() {
         >
             <div className="search-bar__inner">
                 <input
+                    id="global-search-input"
                     type="text"
                     placeholder="FIND..."
                     value={searchQuery}

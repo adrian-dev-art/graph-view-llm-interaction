@@ -20,24 +20,9 @@ async function fileToBase64(file) {
 }
 
 // Stream AI response from Groq, calling onChunk(text) for each token
-async function streamGroqResponse(prompt, mediaItems = [], onChunk) {
+async function streamGroqResponse(messages, mediaItems = [], onChunk) {
     const hasImages = mediaItems.some(f => f.type === 'image')
     const model = hasImages ? VISION_MODEL : TEXT_MODEL
-
-    let content = []
-
-    // Add text prompt
-    content.push({ type: 'text', text: prompt })
-
-    // Add images for vision model (only first few to keep context small)
-    for (const item of mediaItems.slice(0, 3)) {
-        if (item.type === 'image' && hasImages) {
-            content.push({
-                type: 'image_url',
-                image_url: { url: item.url }
-            })
-        }
-    }
 
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
@@ -47,7 +32,7 @@ async function streamGroqResponse(prompt, mediaItems = [], onChunk) {
         },
         body: JSON.stringify({
             model,
-            messages: [{ role: 'user', content: hasImages ? content : prompt }],
+            messages: messages,
             stream: true,
         }),
     })
@@ -82,6 +67,16 @@ async function streamGroqResponse(prompt, mediaItems = [], onChunk) {
     }
     return fullText
 }
+
+const SYSTEM_PROMPT = `You are a branching AI mind. You help users explore ideas in a graph structure. 
+Each of your responses will be placed in a new node.
+If you want to suggest multiple distinct paths or ideas that should each have their own node, separate them with the delimiter: ---NODE---
+Example:
+Idea 1 details...
+---NODE---
+Idea 2 details...
+
+Always provide high-quality, relevant responses. Focus on being "inline" with the user's previous thoughts.`
 
 const useGraphStore = create((set, get) => ({
     // Auth
@@ -175,7 +170,22 @@ const useGraphStore = create((set, get) => ({
 
     setCurrentConvId: async (id) => {
         set({ currentConvId: id, selectedNodeId: null, lastCreatedNodeId: null })
-        await get().fetchNodes(id)
+        if (id) await get().fetchNodes(id)
+        else set({ nodes: [], edges: [], rawNodes: [] })
+    },
+
+    deleteConversation: async (id) => {
+        const { conversations, currentConvId } = get()
+        // Delete conversation (Cascade delete should handle nodes if set in DB, but let's be safe)
+        const { error } = await supabase.from('conversations').delete().eq('id', id)
+        if (error) throw error
+
+        const newConversations = conversations.filter(c => c.id !== id)
+        set({ conversations: newConversations })
+
+        if (currentConvId === id) {
+            set({ currentConvId: null, nodes: [], edges: [], rawNodes: [], selectedNodeId: null })
+        }
     },
 
     // ── Nodes ─────────────────────────────────────────────────
@@ -256,7 +266,6 @@ const useGraphStore = create((set, get) => ({
         const updatedRaw = [...rawNodes, newNode]
         const { rfNodes, rfEdges } = buildGraph(updatedRaw)
 
-        // Immediate update with empty response and trigger zoom
         set({
             rawNodes: updatedRaw,
             nodes: rfNodes,
@@ -266,9 +275,42 @@ const useGraphStore = create((set, get) => ({
             lastCreatedNodeId: newNode.id
         })
 
+        // Gather history
+        const messages = [{ role: 'system', content: SYSTEM_PROMPT }]
+        const historyPath = []
+        let curr = parent
+        while (curr) {
+            historyPath.unshift(curr)
+            curr = rawNodes.find(n => n.id === curr.parent_id)
+        }
+
+        historyPath.forEach(h => {
+            let content = h.prompt
+            if (h.media_items && h.media_items.some(m => m.type === 'image')) {
+                content = [{ type: 'text', text: h.prompt }]
+                h.media_items.filter(m => m.type === 'image').slice(0, 3).forEach(m => {
+                    content.push({ type: 'image_url', image_url: { url: m.url } })
+                })
+            }
+            messages.push({ role: 'user', content })
+            if (h.response) {
+                messages.push({ role: 'assistant', content: h.response })
+            }
+        })
+
+        // Add current prompt
+        let currentContent = prompt
+        if (mediaItems.length > 0) {
+            currentContent = [{ type: 'text', text: prompt }]
+            mediaItems.filter(m => m.type === 'image').slice(0, 3).forEach(m => {
+                currentContent.push({ type: 'image_url', image_url: { url: m.url } })
+            })
+        }
+        messages.push({ role: 'user', content: currentContent })
+
         let response = ''
         try {
-            response = await streamGroqResponse(prompt, mediaItems, (partial) => {
+            response = await streamGroqResponse(messages, mediaItems, (partial) => {
                 set({ streamingText: partial })
             })
         } catch (aiErr) {
@@ -276,9 +318,35 @@ const useGraphStore = create((set, get) => ({
             set({ streamingText: response })
         }
 
-        await supabase.from('nodes').update({ response }).eq('id', newNode.id)
+        const nodeParts = response.split('---NODE---').map(p => p.trim()).filter(p => !!p)
+        const mainResponse = nodeParts[0] || ''
 
-        const finalRaw = updatedRaw.map(n => n.id === newNode.id ? { ...n, response } : n)
+        await supabase.from('nodes').update({ response: mainResponse }).eq('id', newNode.id)
+
+        let finalRaw = updatedRaw.map(n => n.id === newNode.id ? { ...n, response: mainResponse } : n)
+
+        // Handle additional nodes
+        if (nodeParts.length > 1) {
+            for (let i = 1; i < nodeParts.length; i++) {
+                const extraResponse = nodeParts[i]
+                const extraPos = calculatePosition(parent, childrenCount + i)
+                const { data: extraNode } = await supabase
+                    .from('nodes')
+                    .insert({
+                        conversation_id: convId,
+                        parent_id: parentId,
+                        prompt: '(AUTOMATIC BRANCH)',
+                        response: extraResponse,
+                        pos_x: extraPos.x,
+                        pos_y: extraPos.y,
+                        media_items: []
+                    })
+                    .select()
+                    .single()
+                if (extraNode) finalRaw.push(extraNode)
+            }
+        }
+
         const { rfNodes: finalRfNodes, rfEdges: finalEdges } = buildGraph(finalRaw)
 
         set({
